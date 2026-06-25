@@ -21,7 +21,9 @@ RAG/
 │   │   ├── faiss_engine.py    # FAISS 向量检索引擎
 │   │   ├── bm25_engine.py     # BM25 关键词检索引擎
 │   │   ├── embedding.py       # Embedding 向量化服务
-│   │   ├── retriever.py       # 检索器
+│   │   ├── retriever.py       # 混合检索器（FAISS + BM25 + RRF）
+│   │   ├── router.py          # 行业路由器（LLM 自动路由）
+│   │   ├── web_search.py      # 网络搜索模块
 │   │   └── llm_client.py      # LLM 客户端
 │   ├── models/                # 数据模型
 │   │   └── schemas.py         # API 数据结构定义
@@ -89,7 +91,41 @@ RAG/
 | `remove_knowledge(slug, doc_id)` | 删除知识文档及相关索引 |
 | `remove_chunk(slug, doc_id, chunk_id)` | 删除单个切片 |
 
-### 4. 行业 API (`backend/api/industry.py`)
+### 4. 对话服务 (`backend/services/chat_service.py`)
+
+| 函数 | 功能说明 |
+|-----|---------|
+| `stream_chat(query, history, industry_slug, session_id)` | SSE 流式对话，支持多行业轮询检索和网络搜索 |
+| `_retrieve_from_industry(query, industry_slug)` | 从单个行业检索知识 |
+| `create_session(industry, industry_name)` | 创建对话会话 |
+| `get_session(session_id)` | 获取会话详情 |
+| `list_sessions()` | 获取所有会话列表 |
+| `delete_session(session_id)` | 删除会话 |
+| `add_message(session_id, role, content)` | 添加消息到会话 |
+| `get_session_messages(session_id)` | 获取会话消息历史 |
+
+### 5. 核心引擎
+
+#### 检索器 (`backend/core/retriever.py`)
+
+| 类/方法 | 功能说明 |
+|--------|---------|
+| `HybridRetriever` | 混合检索器，集成 FAISS + BM25 + RRF 融合排序 |
+| `retrieve(query)` | 执行混合检索，返回融合排序后的结果 |
+
+#### 行业路由器 (`backend/core/router.py`)
+
+| 函数 | 功能说明 |
+|-----|---------|
+| `route_to_industry(user_query)` | 根据用户问题自动路由到最匹配的行业 |
+
+#### 网络搜索 (`backend/core/web_search.py`)
+
+| 函数 | 功能说明 |
+|-----|---------|
+| `web_search(query, max_results)` | 使用 Bing 搜索获取外部知识，作为知识库检索失败时的兜底方案 |
+
+### 6. 行业 API (`backend/api/industry.py`)
 
 | 接口 | 方法 | 功能说明 |
 |-----|-----|---------|
