@@ -15,6 +15,7 @@ from backend.core.router import route_to_industry
 from backend.core.retriever import HybridRetriever
 from backend.core.faiss_engine import FAISSEngine
 from backend.core.bm25_engine import BM25Engine
+from backend.core.web_search import web_search
 from backend.services.industry_service import (
     get_industry, list_industries, get_document_chunks,
     _get_industry_dir,
@@ -142,6 +143,35 @@ def delete_session(session_id: str) -> bool:
     return True
 
 
+def _retrieve_from_industry(query: str, industry_slug: str) -> tuple[list[dict], list[dict]]:
+    """
+    从单个行业检索
+    返回 (检索结果, 上下文 chunks)
+    """
+    industry_dir = _get_industry_dir(industry_slug)
+    faiss = FAISSEngine(industry_dir / "faiss_index")
+    bm25 = BM25Engine(industry_dir / "bm25_index")
+    retriever = HybridRetriever(faiss, bm25)
+    retrieval_results = retriever.retrieve(query)
+
+    if not retrieval_results:
+        return [], []
+
+    context_chunks = []
+    for r in retrieval_results:
+        chunk_id = r["chunk_id"]
+        parts = chunk_id.rsplit("_chunk_", 1)
+        if len(parts) == 2:
+            doc_id = parts[0]
+            chunks = get_document_chunks(industry_slug, doc_id)
+            for c in chunks:
+                if c["id"] == chunk_id:
+                    context_chunks.append(c)
+                    break
+
+    return retrieval_results, context_chunks
+
+
 def stream_chat(
     query: str,
     history: list[dict] | None = None,
@@ -150,6 +180,7 @@ def stream_chat(
 ) -> Generator[str, None, None]:
     """
     SSE 流式对话
+    检索策略：优先在路由行业检索 -> 多行业轮询检索 -> 网络搜索
     """
     import json as json_mod
 
@@ -171,7 +202,6 @@ def stream_chat(
     # 如果有 session_id，保存用户消息
     if session_id:
         add_message(session_id, "user", query)
-        # 更新会话的行业信息
         if route_result.get("slug") and route_result.get("slug") != "general":
             conn = _get_chat_db()
             conn.execute(
@@ -181,44 +211,66 @@ def stream_chat(
             conn.commit()
             conn.close()
 
-    # 2. 检索
-    if industry_slug and industry_slug != "general" and get_industry(industry_slug):
-        industry_dir = _get_industry_dir(industry_slug)
-        faiss = FAISSEngine(industry_dir / "faiss_index")
-        bm25 = BM25Engine(industry_dir / "bm25_index")
-        retriever = HybridRetriever(faiss, bm25)
-        retrieval_results = retriever.retrieve(query)
+    # 2. 多行业轮询检索
+    all_context_chunks = []
+    all_retrieval_sources = []
+    all_industries = list_industries()
 
-        yield f"data: {json_mod.dumps({'type': 'retrieval', 'data': {'count': len(retrieval_results)}}, ensure_ascii=False)}\n\n"
+    if all_industries:
+        # 确定检索顺序：优先路由行业，然后是其他行业
+        industry_order = []
+        if industry_slug and industry_slug != "general":
+            industry_order.append(industry_slug)
+        for ind in all_industries:
+            slug = ind.get("slug")
+            if slug and slug != industry_slug:
+                industry_order.append(slug)
 
-        if not retrieval_results:
-            yield f"data: {json_mod.dumps({'type': 'token', 'data': '当前知识库中未找到相关内容，无法回答此问题。'}, ensure_ascii=False)}\n\n"
-            yield f"data: {json_mod.dumps({'type': 'done', 'data': {}}, ensure_ascii=False)}\n\n"
-            return
+        yield f"data: {json_mod.dumps({'type': 'retrieval', 'data': {'message': f'开始在 {len(industry_order)} 个行业中检索...'}}, ensure_ascii=False)}\n\n"
 
-        # 获取 chunk 内容
-        context_chunks = []
-        for r in retrieval_results:
-            chunk_id = r["chunk_id"]
-            parts = chunk_id.rsplit("_chunk_", 1)
-            if len(parts) == 2:
-                doc_id = parts[0]
-                chunks = get_document_chunks(industry_slug, doc_id)
-                for c in chunks:
-                    if c["id"] == chunk_id:
-                        context_chunks.append(c)
-                        break
+        for idx, slug in enumerate(industry_order):
+            industry_name = next((ind["name"] for ind in all_industries if ind.get("slug") == slug), slug)
+            yield f"data: {json_mod.dumps({'type': 'retrieval', 'data': {'message': f'正在检索 [{industry_name}] ({idx+1}/{len(industry_order)})...'}}, ensure_ascii=False)}\n\n"
 
-        yield f"data: {json_mod.dumps({'type': 'retrieval', 'data': {'count': len(retrieval_results), 'chunks': [{'chunk_id': c['id'], 'content': c['content'][:200] + '...'} for c in context_chunks[:5]]}}, ensure_ascii=False)}\n\n"
-    else:
-        context_chunks = []
-        yield f"data: {json_mod.dumps({'type': 'retrieval', 'data': {'count': 0}}, ensure_ascii=False)}\n\n"
+            retrieval_results, context_chunks = _retrieve_from_industry(query, slug)
 
-    # 3. 构建 Prompt 并生成回答
+            if retrieval_results:
+                yield f"data: {json_mod.dumps({'type': 'retrieval', 'data': {'message': f'在 [{industry_name}] 中找到 {len(retrieval_results)} 条相关内容'}}, ensure_ascii=False)}\n\n"
+                for c in context_chunks:
+                    c["industry_slug"] = slug
+                    c["industry_name"] = industry_name
+                all_context_chunks.extend(context_chunks)
+                all_retrieval_sources.append({
+                    "industry": industry_name,
+                    "slug": slug,
+                    "count": len(retrieval_results),
+                })
+
+            if len(all_context_chunks) >= 10:
+                break
+
+    # 3. 如果所有行业都检索不到，进行网络搜索
+    if not all_context_chunks:
+        yield f"data: {json_mod.dumps({'type': 'retrieval', 'data': {'message': '知识库中未找到相关内容，正在进行网络搜索...'}}, ensure_ascii=False)}\n\n"
+
+        web_results = web_search(query)
+        if web_results:
+            for i, result in enumerate(web_results[:5]):
+                all_context_chunks.append({
+                    "id": f"web_{i}",
+                    "content": f"【标题】{result.get('title', '')}\n【来源】{result.get('url', '')}\n【摘要】{result.get('snippet', '')}",
+                    "industry_slug": "web",
+                    "industry_name": "网络搜索",
+                })
+            yield f"data: {json_mod.dumps({'type': 'retrieval', 'data': {'message': f'网络搜索找到 {len(web_results)} 条相关内容'}}, ensure_ascii=False)}\n\n"
+        else:
+            yield f"data: {json_mod.dumps({'type': 'retrieval', 'data': {'message': '网络搜索也未找到相关内容'}}, ensure_ascii=False)}\n\n"
+
+    # 4. 构建 Prompt 并生成回答
     context_text = "\n\n---\n\n".join([
-        f"[参考资料 {i+1}]\n{c['content']}"
-        for i, c in enumerate(context_chunks)
-    ]) if context_chunks else "无相关参考资料"
+        f"[参考资料 {i+1}] [来源: {c.get('industry_name', 'unknown')}]\n{c['content']}"
+        for i, c in enumerate(all_context_chunks)
+    ]) if all_context_chunks else "无相关参考资料"
 
     history_text = "\n".join([
         f"{'用户' if m['role'] == 'user' else '助手'}: {m['content']}"
@@ -228,7 +280,7 @@ def stream_chat(
     system_prompt = (
         "你是一个专业的行业知识助手，请根据提供的参考资料回答用户问题。"
         "如果参考资料不足以回答问题，请如实告知用户无法回答，不要编造信息。"
-        "回答时请注明引用的资料编号。"
+        "回答时请注明引用的资料编号和来源。"
     )
 
     user_prompt = f"""## 参考资料
@@ -240,14 +292,14 @@ def stream_chat(
 ## 用户问题
 {query}
 
-请基于以上参考资料回答问题。如果资料不足以回答，请明确说明。回答时请注明引用的资料编号。"""
+请基于以上参考资料回答问题。如果资料不足以回答，请明确说明。回答时请注明引用的资料编号和来源。"""
 
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
-    # 流式调用 LLM
+    # 5. 流式调用 LLM
     try:
         response = chat_completion(messages, stream=True)
         full_answer = ""
@@ -264,12 +316,10 @@ def stream_chat(
                     if finish_reason == 'stop':
                         break
 
-        yield f"data: {json_mod.dumps({'type': 'done', 'data': {'answer': full_answer, 'sources': [{'chunk_id': c['id'], 'content': c['content'][:100]} for c in context_chunks[:5]]}}, ensure_ascii=False)}\n\n"
+        yield f"data: {json_mod.dumps({'type': 'done', 'data': {'answer': full_answer, 'sources': [{'chunk_id': c['id'], 'content': c['content'][:100], 'source': c.get('industry_name', 'unknown')} for c in all_context_chunks[:5]], 'retrieval_sources': all_retrieval_sources}}, ensure_ascii=False)}\n\n"
 
-        # 如果有 session_id，保存助手消息
         if session_id and full_answer:
             add_message(session_id, "assistant", full_answer)
-            # 更新会话标题（取第一条用户消息的前20个字符）
             if full_answer:
                 conn = _get_chat_db()
                 conn.execute(
