@@ -136,7 +136,7 @@ RAG/
 | `/api/v1/industries/{slug}/chunk-config` | GET | 获取分片配置 |
 | `/api/v1/industries/{slug}` | DELETE | 删除行业 |
 
-### 5. 知识 API (`backend/api/knowledge.py`)
+### 7. 知识 API (`backend/api/knowledge.py`)
 
 | 接口 | 方法 | 功能说明 |
 |-----|-----|---------|
@@ -146,6 +146,17 @@ RAG/
 | `/api/v1/industries/{slug}/knowledge/{doc_id}` | DELETE | 删除知识文档 |
 | `/api/v1/industries/{slug}/knowledge/{doc_id}/chunks` | GET | 获取文档切片 |
 | `/api/v1/industries/{slug}/knowledge/{doc_id}/chunks/{chunk_id}` | DELETE | 删除单个切片 |
+
+### 8. 对话 API (`backend/api/chat.py`)
+
+| 接口 | 方法 | 功能说明 |
+|-----|-----|---------|
+| `/api/v1/chat/route` | POST | 行业路由判断 |
+| `/api/v1/chat/stream` | POST | SSE 流式对话 |
+| `/api/v1/chat/history` | GET | 获取对话历史列表 |
+| `/api/v1/chat/history/{session_id}` | GET | 获取会话消息 |
+| `/api/v1/chat/history` | POST | 创建新对话会话 |
+| `/api/v1/chat/history/{session_id}` | DELETE | 删除对话会话 |
 
 ## 前端功能说明
 
@@ -179,6 +190,8 @@ RAG/
 | 新建对话 | 创建新的对话会话 |
 | 删除对话 | 删除指定对话会话 |
 | 智能问答 | 基于行业知识进行问答 |
+| 多行业检索 | 自动在多个行业知识库中轮询检索 |
+| 网络搜索 | 知识库检索失败时自动进行网络搜索 |
 | 上下文保持 | 支持多轮对话上下文 |
 
 ### 4. API 调用层
